@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -12,7 +13,7 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-  import { getDatabase, ref, set, get, onValue }
+  import { getDatabase, ref, set, get, remove, onValue }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 
   const firebaseConfig = {
@@ -25,10 +26,8 @@
     databaseURL: "https://niji-string-default-rtdb.asia-southeast1.firebasedatabase.app"
   };
 
-  // ✅ 허용된 이메일 목록 (여기에 추가/삭제하면 됩니다)
-  const ALLOWED_EMAILS = [
-    "jola7120@gmail.com"
-  ];
+  // ✅ 관리자 이메일 (니지님 계정 - 승인 권한 있음)
+  const ADMIN_EMAIL = "jola7120@gmail.com";
 
   const app = initializeApp(firebaseConfig);
   const auth = getAuth(app);
@@ -41,17 +40,36 @@
   window._firebaseRef = ref;
   window._firebaseSet = set;
   window._firebaseGet = get;
-  window._firebaseOnValue = onValue;
+  window._firebaseRemove = remove;
+  window._ADMIN_EMAIL = ADMIN_EMAIL;
 
   // 구글 로그인
   window.googleLogin = async function() {
     try {
+      document.getElementById('loginError').textContent = '로그인 중...';
       const result = await signInWithPopup(auth, provider);
-      const email = result.user.email;
-      if (!ALLOWED_EMAILS.includes(email)) {
-        await signOut(auth);
-        document.getElementById('loginError').textContent = '❌ 접근 권한이 없습니다. (' + email + ')';
+      const user = result.user;
+
+      // 관리자면 바로 승인 처리
+      if (user.email === ADMIN_EMAIL) {
+        await set(ref(db, 'users/' + user.uid), {
+          email: user.email,
+          name: user.displayName || '',
+          status: 'approved',
+          requestedAt: Date.now()
+        });
         return;
+      }
+
+      // 일반 사용자: 대기 등록
+      const snap = await get(ref(db, 'users/' + user.uid));
+      if (!snap.exists()) {
+        await set(ref(db, 'users/' + user.uid), {
+          email: user.email,
+          name: user.displayName || '',
+          status: 'pending',
+          requestedAt: Date.now()
+        });
       }
     } catch(e) {
       document.getElementById('loginError').textContent = '로그인 실패: ' + e.message;
@@ -64,19 +82,76 @@
     await signOut(auth);
   };
 
+  // 승인 처리 (관리자용)
+  window.approveUser = async function(uid) {
+    await set(ref(db, 'users/' + uid + '/status'), 'approved');
+    showToast('✅ 승인 완료!');
+    renderUserManagement();
+  };
+
+  // 거절/차단 처리 (관리자용)
+  window.rejectUser = async function(uid) {
+    await set(ref(db, 'users/' + uid + '/status'), 'rejected');
+    showToast('🚫 거절 처리했습니다');
+    renderUserManagement();
+  };
+
+  // 사용자 관리 화면 렌더링
+  window.renderUserManagement = async function() {
+    const el = document.getElementById('userManageList');
+    if (!el) return;
+    const snap = await get(ref(db, 'users'));
+    if (!snap.exists()) { el.innerHTML = '<div style="color:var(--text-sub);text-align:center;padding:16px;">신청자 없음</div>'; return; }
+    const users = snap.val();
+    el.innerHTML = Object.entries(users).map(([uid, u]) => `
+      <div style="background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:14px;margin-bottom:10px;">
+        <div style="font-size:14px;font-weight:700;margin-bottom:4px;">${u.name || '이름없음'}</div>
+        <div style="font-size:12px;color:var(--text-sub);margin-bottom:10px;">${u.email}</div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <span style="font-size:11px;padding:3px 10px;border-radius:20px;font-weight:700;
+            background:${u.status==='approved'?'rgba(16,185,129,0.2)':u.status==='pending'?'rgba(245,158,11,0.2)':'rgba(239,68,68,0.2)'};
+            color:${u.status==='approved'?'#34d399':u.status==='pending'?'#fbbf24':'#f87171'};">
+            ${u.status==='approved'?'✅ 승인됨':u.status==='pending'?'⏳ 대기중':'🚫 거절됨'}
+          </span>
+          ${u.email !== ADMIN_EMAIL ? `
+            ${u.status !== 'approved' ? `<button onclick="approveUser('${uid}')" style="padding:4px 12px;background:linear-gradient(135deg,#059669,#10b981);color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;">승인</button>` : ''}
+            ${u.status !== 'rejected' ? `<button onclick="rejectUser('${uid}')" style="padding:4px 12px;background:linear-gradient(135deg,#dc2626,#ef4444);color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;">거절</button>` : ''}
+          ` : '<span style="font-size:11px;color:var(--text-sub);">관리자</span>'}
+        </div>
+      </div>
+    `).join('');
+  };
+
   // 로그인 상태 감지
   onAuthStateChanged(auth, async (user) => {
-    if (user && ALLOWED_EMAILS.includes(user.email)) {
-      // 로그인 성공 → 앱 표시
+    if (!user) {
+      document.getElementById('loginScreen').style.display = 'flex';
+      document.getElementById('pendingScreen').style.display = 'none';
+      document.getElementById('appScreen').style.display = 'none';
+      return;
+    }
+
+    // Firebase에서 사용자 상태 확인
+    const snap = await get(ref(db, 'users/' + user.uid));
+    const userData = snap.exists() ? snap.val() : null;
+    const status = userData ? userData.status : 'pending';
+
+    if (status === 'approved') {
+      // ✅ 승인된 사용자 → 앱 표시
       document.getElementById('loginScreen').style.display = 'none';
+      document.getElementById('pendingScreen').style.display = 'none';
       document.getElementById('appScreen').style.display = 'block';
       document.getElementById('userEmail').textContent = user.email;
 
+      // 관리자면 사용자 관리 탭 표시
+      const adminTab = document.getElementById('adminTabBtn');
+      if (adminTab) adminTab.style.display = user.email === ADMIN_EMAIL ? 'flex' : 'none';
+
       // Firebase에서 데이터 불러오기
-      const snapshot = await get(ref(db, 'fishingCRM/' + user.uid));
-      if (snapshot.exists()) {
+      const dataSnap = await get(ref(db, 'fishingCRM/' + user.uid));
+      if (dataSnap.exists()) {
         try {
-          DB = snapshot.val();
+          DB = dataSnap.val();
           if (!DB.settings) DB.settings = {};
           const def = { maxSeat: 20, boatName: '대천호', ownerName: '선장님', phone: '', location: '대천항', departTime: '05:00', defaultFee: 8, regularCount: 3, vipCount: 5, inactiveDays: 60 };
           DB.settings = Object.assign({}, def, DB.settings);
@@ -86,7 +161,6 @@
         } catch(e) { console.log('데이터 파싱 오류'); }
       }
 
-      // Firebase 실시간 저장 함수 교체
       window._currentUID = user.uid;
       window.saveData = function() {
         set(ref(db, 'fishingCRM/' + window._currentUID), DB);
@@ -97,10 +171,20 @@
       document.getElementById('resDayPicker').value = todayStr();
       document.getElementById('revDate').value = todayStr();
 
-    } else {
-      // 로그아웃 상태
-      document.getElementById('loginScreen').style.display = 'flex';
+    } else if (status === 'pending') {
+      // ⏳ 대기중
+      document.getElementById('loginScreen').style.display = 'none';
       document.getElementById('appScreen').style.display = 'none';
+      document.getElementById('pendingScreen').style.display = 'flex';
+      document.getElementById('pendingEmail').textContent = user.email;
+
+    } else {
+      // 🚫 거절됨
+      document.getElementById('loginScreen').style.display = 'none';
+      document.getElementById('appScreen').style.display = 'none';
+      document.getElementById('pendingScreen').style.display = 'flex';
+      document.getElementById('pendingEmail').textContent = user.email;
+      document.getElementById('pendingMsg').textContent = '🚫 접근이 거절된 계정입니다. 관리자에게 문의하세요.';
     }
   });
 </script>
@@ -183,8 +267,30 @@
   .google-icon { width: 22px; height: 22px; }
   #loginError { color: #f87171; font-size: 13px; margin-top: 14px; min-height: 20px; }
 
-  /* 앱 화면 */
-  #appScreen { display: none; }
+  /* 대기 화면 */
+  #pendingScreen {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    background: linear-gradient(135deg, #0a1628 0%, #0d2244 100%);
+    padding: 20px;
+  }
+  .pending-box {
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 24px;
+    padding: 40px 30px;
+    text-align: center;
+    width: 100%;
+    max-width: 360px;
+  }
+  .pending-icon { font-size: 52px; margin-bottom: 12px; }
+  .pending-title { font-size: 20px; font-weight: 900; color: #fff; margin-bottom: 8px; }
+  .pending-sub { font-size: 13px; color: #93b4d4; margin-bottom: 6px; line-height: 1.6; }
+  #pendingEmail { font-size: 13px; color: #fbbf24; font-weight: 700; margin-bottom: 20px; }
+  #pendingMsg { font-size: 13px; color: #f87171; margin-top: 10px; }
 
   /* 로그아웃 버튼 */
   .logout-info {
@@ -919,6 +1025,20 @@
   </div>
 </div>
 
+<!-- ========== 대기 화면 ========== -->
+<div id="pendingScreen">
+  <div class="pending-box">
+    <div class="pending-icon">⏳</div>
+    <div class="pending-title">승인 대기중</div>
+    <div class="pending-sub">관리자 승인 후 이용 가능합니다<br>잠시만 기다려 주세요</div>
+    <div id="pendingEmail"></div>
+    <div id="pendingMsg"></div>
+    <button class="btn-google" onclick="doLogout()" style="margin-top:10px;">
+      🚪 로그아웃
+    </button>
+  </div>
+</div>
+
 <!-- ========== 앱 화면 ========== -->
 <div id="appScreen">
 
@@ -1400,6 +1520,15 @@
       <div style="font-size:11px;color:var(--text-sub);margin-top:8px;">버전 1.0 · 대천항 피싱 CRM</div>
     </div>
 
+    <!-- 사용자 관리 (관리자만 표시) -->
+    <div class="card" id="userManageCard" style="display:none;">
+      <div class="card-title">👤 사용자 관리</div>
+      <button class="btn btn-primary btn-full" onclick="renderUserManagement()" style="margin-bottom:12px;">🔄 목록 새로고침</button>
+      <div id="userManageList">
+        <div style="color:var(--text-sub);text-align:center;padding:16px;">불러오는 중...</div>
+      </div>
+    </div>
+
   </div>
 
 </div>
@@ -1728,7 +1857,16 @@ function switchTab(tab) {
   if (tab === 'customers') renderCustomerList();
   if (tab === 'reservations') renderReservations();
   if (tab === 'revenue') { renderRevenue(); renderRevChart(); }
-  if (tab === 'settings') renderSettingsForm();
+  if (tab === 'settings') {
+    renderSettingsForm();
+    // 관리자면 사용자 관리 카드 표시
+    const card = document.getElementById('userManageCard');
+    if (card && window._firebaseAuth && window._firebaseAuth.currentUser) {
+      const isAdmin = window._firebaseAuth.currentUser.email === window._ADMIN_EMAIL;
+      card.style.display = isAdmin ? 'block' : 'none';
+      if (isAdmin) renderUserManagement();
+    }
+  }
 }
 
 // ============================
